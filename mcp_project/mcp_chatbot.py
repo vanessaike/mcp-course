@@ -1,35 +1,26 @@
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
-from mcp import ClientSession, StdioServerParameters, types
+from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from contextlib import AsyncExitStack
-from typing import List, Dict, TypedDict
-import asyncio
-import nest_asyncio
-import os
 import json
+import asyncio
+import os
+import nest_asyncio
 
-# nest_asyncio.apply()
+nest_asyncio.apply()
 load_dotenv()
 
-class ToolDefinition(TypedDict):
-    name: str
-    description: str
-    input_schema: dict
-
 class MCP_ChatBot:
-
     def __init__(self):
-        self.sessions: List[ClientSession] = []
-        # context manager that will manage the mcp client objects and their sessions and ensures that they are properly closed:
         self.exit_stack = AsyncExitStack()
         self.client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        self.available_tools: List[ToolDefinition] = []
-        # maps the tool name to the corresponding client session:
-        self.tool_to_session: Dict[str, ClientSession] = {}
 
-    async def connect_to_server(self, server_name:str, server_config: dict) -> None:
-        """Connect to a single MCP server."""
+        self.available_tools = []
+        self.available_prompts = []
+        self.sessions = {}  # Map tool/prompt/resource names/URIs -> sessions
+
+    async def connect_to_server(self, server_name, server_config):
         try:
             server_params = StdioServerParameters(**server_config)
             stdio_transport = await self.exit_stack.enter_async_context(
@@ -40,15 +31,11 @@ class MCP_ChatBot:
                 ClientSession(read, write)
             )
             await session.initialize()
-            self.sessions.append(session)
-            
-            # List available tools for this session
+
+            # Tools
             response = await session.list_tools()
-            tools = response.tools
-            print(f"\nConnected to {server_name} with tools:", [t.name for t in tools])
-            
-            for tool in tools:
-                self.tool_to_session[tool.name] = session
+            for tool in response.tools:
+                self.sessions[tool.name] = session
                 self.available_tools.append({
                     "type": "function",
                     "function": {
@@ -57,28 +44,45 @@ class MCP_ChatBot:
                         "parameters": tool.inputSchema
                     }
                 })
+
+            # Prompts
+            prompts_response = await session.list_prompts()
+            if prompts_response and prompts_response.prompts:
+                for prompt in prompts_response.prompts:
+                    self.sessions[prompt.name] = session
+                    self.available_prompts.append({
+                        "name": prompt.name,
+                        "description": prompt.description,
+                        "arguments": prompt.arguments
+                    })
+
+            # Resources
+            resources_response = await session.list_resources()
+            if resources_response and resources_response.resources:
+                for resource in resources_response.resources:
+                    uri = str(resource.uri)
+                    self.sessions[uri] = session
+
+            print(f"Connected to {server_name} with tools: {[t['function']['name'] for t in self.available_tools]}")
+
         except Exception as e:
-            print(f"Failed to connect to {server_name}: {e}")
+            print(f"Error connecting to {server_name}: {e}")
 
     async def connect_to_servers(self):
-        """Connect to all configured MCP servers."""
         try:
             with open("server_config.json", "r") as file:
                 data = json.load(file)
-            
             servers = data.get("mcpServers", {})
-            
             for server_name, server_config in servers.items():
                 await self.connect_to_server(server_name, server_config)
         except Exception as e:
-            print(f"Error loading server configuration: {e}")
+            print(f"Error loading server config: {e}")
             raise
 
     async def process_query(self, query):
         messages = [{"role": "user", "content": query}]
-        process_query = True
 
-        while process_query:
+        while True:
             response = await self.client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=messages,
@@ -88,61 +92,32 @@ class MCP_ChatBot:
             )
 
             message = response.choices[0].message
-            tool_call = message.tool_calls[0] if message.tool_calls else None
+            tool_calls = message.tool_calls
 
-            if tool_call:
-                tool_name = tool_call.function.name
-                tool_args = json.loads(tool_call.function.arguments)
-                tool_id = tool_call.id
-
-                print(f"Calling tool {tool_name} with args {tool_args}")
-
-                session = self.tool_to_session[tool_name] 
-                result = await session.call_tool(tool_name, arguments=tool_args)
-
-                messages.append({
-                    "role": "assistant",
-                    "tool_calls": [{
-                        "id": tool_id,
-                        "type": "function",
-                        "function": {
-                            "name": tool_name,
-                            "arguments": json.dumps(tool_args)
-                        }
-                    }]
-                })
-
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tool_id,
-                    "content": result.content
-                })
-
-            else:
-                print(message.content)
-                process_query = False
-
-                message = response.choices[0].message
-                tool_call = message.tool_calls[0] if message.tool_calls else None
-
-                if tool_call:
-                    tool_name = tool_call.function.name
-                    tool_args = json.loads(tool_call.function.arguments)
-                    tool_id = tool_call.id
+            if tool_calls:
+                for call in tool_calls:
+                    tool_name = call.function.name
+                    tool_args = json.loads(call.function.arguments)
+                    tool_id = call.id
 
                     print(f"Calling tool {tool_name} with args {tool_args}")
 
-                    result = await self.session.call_tool(tool_name, arguments=tool_args)
+                    session = self.sessions.get(tool_name)
+                    if not session:
+                        print(f"Tool '{tool_name}' not found.")
+                        return
+
+                    result = await session.call_tool(tool_name, arguments=tool_args)
 
                     messages.append({
                         "role": "assistant",
                         "tool_calls": [{
                             "id": tool_id,
+                            "type": "function",
                             "function": {
                                 "name": tool_name,
                                 "arguments": json.dumps(tool_args)
-                            },
-                            "type": "function"
+                            }
                         }]
                     })
 
@@ -151,30 +126,119 @@ class MCP_ChatBot:
                         "tool_call_id": tool_id,
                         "content": result.content
                     })
+            else:
+                print(message.content)
+                break
+
+    async def get_resource(self, resource_uri):
+        session = self.sessions.get(resource_uri)
+
+        if not session and resource_uri.startswith("papers://"):
+            for uri, sess in self.sessions.items():
+                if uri.startswith("papers://"):
+                    session = sess
+                    break
+
+        if not session:
+            print(f"Resource '{resource_uri}' not found.")
+            return
+
+        try:
+            result = await session.read_resource(uri=resource_uri)
+            if result and result.contents:
+                print(f"\nResource: {resource_uri}")
+                print("Content:")
+                print(result.contents[0].text)
+            else:
+                print("No content available.")
+        except Exception as e:
+            print(f"Error: {e}")
+
+    async def list_prompts(self):
+        if not self.available_prompts:
+            print("No prompts available.")
+            return
+
+        print("\nAvailable prompts:")
+        for prompt in self.available_prompts:
+            print(f"- {prompt['name']}: {prompt['description']}")
+            if prompt['arguments']:
+                print("  Arguments:")
+                for arg in prompt['arguments']:
+                    name = arg.name if hasattr(arg, 'name') else arg.get('name', '')
+                    print(f"    - {name}")
+
+    async def execute_prompt(self, prompt_name, args):
+        session = self.sessions.get(prompt_name)
+        if not session:
+            print(f"Prompt '{prompt_name}' not found.")
+            return
+
+        try:
+            result = await session.get_prompt(prompt_name, arguments=args)
+            if result and result.messages:
+                content = result.messages[0].content
+                if isinstance(content, str):
+                    text = content
+                elif hasattr(content, 'text'):
+                    text = content.text
                 else:
-                    print(message.content)
-                    process_query = False
+                    text = " ".join(item.text if hasattr(item, 'text') else str(item) for item in content)
+                print(f"\nExecuting prompt '{prompt_name}'...")
+                await self.process_query(text)
+        except Exception as e:
+            print(f"Error: {e}")
 
     async def chat_loop(self):
-        """Run an interactive chat loop"""
         print("\nMCP Chatbot Started!")
         print("Type your queries or 'quit' to exit.")
-        
+        print("Use @folders to see available topics")
+        print("Use @<topic> to search papers in that topic")
+        print("Use /prompts to list available prompts")
+        print("Use /prompt <name> <arg1=value1> to execute a prompt")
+
         while True:
             try:
                 query = input("\nQuery: ").strip()
-        
+                if not query:
+                    continue
+
                 if query.lower() == 'quit':
                     break
-                    
+
+                if query.startswith('@'):
+                    topic = query[1:]
+                    uri = "papers://folders" if topic == "folders" else f"papers://{topic}"
+                    await self.get_resource(uri)
+                    continue
+
+                if query.startswith('/'):
+                    parts = query.split()
+                    command = parts[0].lower()
+
+                    if command == '/prompts':
+                        await self.list_prompts()
+                    elif command == '/prompt':
+                        if len(parts) < 2:
+                            print("Usage: /prompt <name> <arg1=value1> <arg2=value2>")
+                            continue
+                        prompt_name = parts[1]
+                        args = {}
+                        for arg in parts[2:]:
+                            if '=' in arg:
+                                key, value = arg.split('=', 1)
+                                args[key] = value
+                        await self.execute_prompt(prompt_name, args)
+                    else:
+                        print(f"Unknown command: {command}")
+                    continue
+
                 await self.process_query(query)
-                print("\n")
-                    
+
             except Exception as e:
                 print(f"\nError: {str(e)}")
-    
+
     async def cleanup(self):
-        """Cleanly close all resources using AsyncExitStack."""
         await self.exit_stack.aclose()
 
 async def main():
